@@ -1,7 +1,8 @@
 openstack-at-home-ubuntu
 ========================
 
-Openstack Initial Provisioning at Home with Ubuntu 
+Openstack Initial Provisioning at Home with Ubuntu. (Support for Ubuntu 14.04 LTS/trusty, and Openstack Icehouse)
+
 
 * code by Jioh L. Jung (ziozzang@gmail.com)
 
