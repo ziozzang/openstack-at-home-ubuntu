@@ -1,0 +1,28 @@
+#!/usr/bin/python
+# -*- coding:utf-8 -*-
+#
+# ini file  configure update script.
+# Warning: This code doesn't preserve comment
+#
+# - code by Jioh L. Jung (ziozzang@gmail.com)
+#
+
+import sys
+
+if len(sys.argv) < 4:
+  print "Usage :\n # %s file section key ...." % sys.argv[0]
+  exit(0)
+
+import ConfigParser
+
+config = ConfigParser.RawConfigParser(allow_no_value=True)
+config.read(sys.argv[1])
+#if sys.argv[2] != "DEFAULT" and config.has_section(sys.argv[2]) == False:
+#   config.add_section(sys.argv[2])
+if config.has_option(sys.argv[2], sys.argv[3]):
+  print config.get(sys.argv[2],sys.argv[3])
+
+config.remove_option(sys.argv[2],sys.argv[3])
+
+with open(sys.argv[1], 'w') as configfile:
+  config.write(configfile)

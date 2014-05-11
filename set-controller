@@ -1,0 +1,729 @@
+#/bin/bash
+#
+# - code by ziozzang@gmail.com
+# - NIC 등을 설정.
+#
+
+PUBLIC_IP=${PUBLIC_IP:-"10.1.1.33"}
+PUBLIC_NIC=${PUBLIC_NIC:-"eth0"}
+MGMT_IP=${MGMT_IP:-"10.2.0.1"}
+MGMT_NIC=${MGMT_NIC:-"eth1"}
+PRIVATE_IP=${PRIVATE_IP:-"10.3.0.1"}
+PRIVATE_NIC=${PRIVATE_NIC:-"eth2"}
+
+MGMT_ID=${MGMT_ID:-"system"}
+
+ADMIN_ID=${ADMIN_ID:-"admin"}
+ADMIN_PW=${ADMIN_PW:-"password0"}
+ADMIN_PRJ=${ADMIN_PRJ:-"home"}
+
+# Physical Index for Private Network.
+PHY_IDX=${PHY_IDX:-"0"}
+
+DISK_IMAGE_HOST=${DISK_IMAGE_HOST:-"http://10.1.1.50/openstack/"}
+DISK_IMAGE_NAME=${DISK_IMAGE_NAME:-"ubuntu-14.04-server-cloudimg-amd64"}
+
+###################################################
+#
+[[ "$(id -u)" -eq 0 ]] || (echo "no root permission"; exit 1)
+
+CNT=`grep IPSET_OK /etc/network/interfaces | wc -l`
+if [ "$CNT" -eq "0" ]; then
+  cat > /etc/network/interfaces << EOF
+# IPSET_OK
+# PUBLIC
+auto ${PUBLIC_NIC}
+iface ${PUBLIC_NIC} inet static
+address ${PUBLIC_IP}
+netmask 255.255.255.0
+gateway 10.1.1.1
+
+# MGMT
+auto ${MGMT_NIC}
+iface ${MGMT_NIC} inet static
+address ${MGMT_IP}
+netmask 255.255.0.0
+
+# PRIVATE
+auto ${PRIVATE_NIC}
+iface ${PRIVATE_NIC} inet static
+address ${PRIVATE_IP}
+netmask 255.255.0.0
+
+dns-nameservers 8.8.8.8
+EOF
+  cat > /etc/resolv.conf << EOF
+nameserver 8.8.8.8
+EOF
+  wget -O "/usr/bin/ini-set" "https://raw.githubusercontent.com/ziozzang/openstack-at-home-ubuntu/master/ini-set"
+  chmod +x /usr/bin/ini-set
+  wget -O "/usr/bin/ini-unset" "https://raw.githubusercontent.com/ziozzang/openstack-at-home-ubuntu/master/ini-unset"
+  chmod +x /usr/bin/ini-unset
+  
+  sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+  sysctl -p
+  
+  apt-get update
+  apt-get upgrade -fy
+
+  # NTP install
+  apt-get install -fy ntp
+  NTP_CONF="/etc/ntp.conf"
+  CNT=`grep KOREAN_SERVER ${NTP_CONF} | wc -l`
+  if [[ "$CNT" -eq "0" ]]; then
+    sed -i -e "s/^server/#server/g" ${NTP_CONF}
+    # Set Korean NTP server
+    echo "#KOREAN_SERVER" >> ${NTP_CONF}
+    echo "server time.bora.net" >> ${NTP_CONF}
+    echo "server time.kriss.re.kr" >> ${NTP_CONF}
+    echo "server time.nuri.net" >> ${NTP_CONF}
+  fi
+
+  RFILE="/etc/rc.runonce"
+  wget -O ${RFILE} "https://raw.githubusercontent.com/ziozzang/openstack-at-home-ubuntu/master/set-controller"
+  cat > /etc/rc.local << EOF
+#!/bin/sh -e
+RFILE="/etc/rc.runonce"
+if [ -f "${RFILE}" ]; then
+  echo "start===============================" >> /var/log/run_once.log
+  date --rfc-2822 >> /var/log/run_once.log
+  bash ${RFILE} >> /var/log/run_once.log &2>1
+  sleep 1
+  date --rfc-2822 >> /var/log/run_once.log
+  echo "done================================" >> /var/log/run_once.log
+  rm -f ${RFILE}
+fi
+EOF
+
+  echo "Rebooting system..."
+  reboot
+else
+  echo "enter Phase #2"
+
+fi
+
+
+# 랜덤 패스워드를 생성 - 실제 유저가 쓸 PW
+RND_PW=`openssl rand -hex 10`
+if [ -f "/root/pwd" ]; then
+  RND_PW=`cat /root/pwd`
+else
+  echo "${RND_PW}" > /root/pwd
+fi
+
+# 내부에서 사용할 PW 를 설정
+INTERNAL_PW=`openssl rand -hex 10`
+if [ -f "/root/pwd.internal" ]; then
+  INTERNAL_PW=`cat /root/pwd.internal`
+else
+  echo "${INTERNAL_PW}" > /root/pwd.internal
+fi
+
+# Set Default Password / INTERNAL_PW
+# - 이게 MYSQL의 버전이 명시 되어야 debconf 를 넣어줄수 있음..
+MYSQL_VERSION=$(apt-cache show mysql-server | grep ^Source | uniq  | cut -d- -f2)
+cat <<EOF | debconf-set-selections
+mysql-server-${MYSQL_VERSION} mysql-server/root_password password ${INTERNAL_PW}
+mysql-server-${MYSQL_VERSION} mysql-server/root_password_again password ${INTERNAL_PW}
+mysql-server-${MYSQL_VERSION} mysql-server/start_on_boot boolean true
+EOF
+
+apt-get install -fy \
+  python-pip \
+  python-mysqldb mysql-server \
+  rabbitmq-server \
+  python-software-properties \
+  software-properties-common
+
+# Set RabbitMQ
+rabbitmqctl change_password guest ${INTERNAL_PW}
+update-rc.d rabbitmq-server enable
+service rabbitmq-server restart
+
+# Set MySQL
+MYSQL_CONF="/etc/mysql/my.cnf"
+mysql -uroot -p${INTERNAL_PW} -e "GRANT ALL PRIVILEGES ON *.* TO '${MGMT_ID}'@'%' IDENTIFIED BY '${INTERNAL_PW}';"
+mysql -uroot -p${INTERNAL_PW} -e "GRANT ALL PRIVILEGES ON *.* TO '${MGMT_ID}'@'localhost' IDENTIFIED BY '${INTERNAL_PW}';"
+sed -i -e "s/\(bind-address\)\s*=.*/\1=${MGMT_IP}/g" ${MYSQL_CONF}
+
+CNT=`grep MYSQL_UPDATED ${MYSQL_CONF} | wc -l`
+if [ "$CNT" -eq "0" ]; then
+  sed -i -e "s/\(\[mysqld\]\)/\1\ndefault-storage-engine = innodb/g" \
+         -e "s/\(\[mysqld\]\)/\1\ncollation-server = utf8_general_ci/g" \
+         -e "s/\(\[mysqld\]\)/\1\ninit-connect = 'SET NAMES utf8'/g" \
+         -e "s/\(\[mysqld\]\)/\1\ncharacter-set-server = utf8/g" ${MYSQL_CONF}
+  echo "#MYSQL_UPDATED" >> ${MYSQL_CONF}
+fi
+
+update-rc.d mysql enable
+service mysql restart
+
+# Set Opnestack Icehouse Repository - for precise
+CNT=`grep precise /etc/lsb-release | wc -l`
+if [ "$CNT" -gt "0" ]; then
+  add-apt-repository cloud-archive:icehouse
+  apt-get update
+  apt-get dist-upgrade -fy
+fi
+
+# set firewall
+ufw allow in on ${MGMT_NIC} proto tcp to ${MGMT_IP} port 5672
+ufw allow in on ${MGMT_NIC} proto tcp to ${MGMT_IP} port 3306
+
+#===============================================================================
+# Functions
+
+backup_conf() {
+  local fn="$1"
+  if [[ -f "${fn}.org" ]]; then
+    cp -f ${fn}.org ${fn}
+  else
+    cp -f ${fn} ${fn}.org
+  fi
+}
+
+#===============================================================================
+# Setup Keystone
+apt-get install -fy keystone
+service keystone stop
+
+rm -rf /var/lib/keystone/keystone.db
+mysql -u${MGMT_ID} -p${INTERNAL_PW} -e "DROP DATABASE IF EXISTS keystone;"
+mysql -u${MGMT_ID} -p${INTERNAL_PW} -e "CREATE DATABASE keystone;"
+
+backup_conf "/etc/keystone/keystone.conf"
+
+ini-set /etc/keystone/keystone.conf DEFAULT admin_token ${ADMIN_PW}
+ini-set /etc/keystone/keystone.conf DEFAULT verbose True
+ini-set /etc/keystone/keystone.conf DEFAULT log_dir /var/log/keystone
+ini-set /etc/keystone/keystone.conf database connection mysql://${MGMT_ID}:${INTERNAL_PW}@${MGMT_IP}/keystone
+
+su -s /bin/sh -c "keystone-manage db_sync" keystone
+service keystone start
+
+# - wait until keystone load complete
+sleep 5
+
+(crontab -l 2>&1 | grep -q token_flush) || \
+echo '@hourly /usr/bin/keystone-manage token_flush >/var/log/keystone/keystone-tokenflush.log 2>&1' >> /var/spool/cron/crontabs/root
+
+export SERVICE_TOKEN=${ADMIN_PW}
+export SERVICE_ENDPOINT=http://${MGMT_IP}:35357/v2.0
+
+function acquire_uuid () {
+        echo `"$@" | grep ' id ' | awk '{print $4}'`
+}
+
+# Tenant
+ADMIN_TENANT=$(acquire_uuid keystone tenant-create --name=admin --description="Admin Tenant")
+PROJ_TENENT=$(acquire_uuid keystone tenant-create --name=${ADMIN_PRJ} --description="Home Tenant")
+
+# Users
+ADMIN_USER=$(acquire_uuid keystone user-create --name=${ADMIN_ID} --pass=${ADMIN_PW} --email=ziozzang@gmail.com --tenant_id=${ADMIN_TENANT})
+SYSTEM_USER=$(acquire_uuid keystone user-create --name=${MGMT_ID} --pass=${INTERNAL_PW} --email=no@where --tenant_id=${ADMIN_TENANT})
+
+# add roles
+ADMIN_ROLE=$(acquire_uuid keystone role-create --name=admin)
+MEMBER_ROLE=$(acquire_uuid keystone role-create --name=Member)
+KEYSTONEADMIN_ROLE=$(acquire_uuid keystone role-create --name=KeystoneAdmin)
+KEYSTONESERVICE_ROLE=$(acquire_uuid keystone role-create --name=KeystoneServiceAdmin)
+SYSADMIN_ROLE=$(acquire_uuid keystone role-create --name=sysadmin)
+NETADMIN_ROLE=$(acquire_uuid keystone role-create --name=netadmin)
+
+# Assign Permission
+keystone user-role-add --user_id ${ADMIN_ID} --role admin --tenant admin
+keystone user-role-add --user_id ${MGMT_ID} --role admin --tenant admin
+keystone user-role-add --user_id ${ADMIN_ID} --role Member --tenant admin
+keystone user-role-add --user_id ${MGMT_ID} --role Member --tenant admin
+keystone user-role-add --user_id ${ADMIN_ID} --role admin --tenant ${ADMIN_PRJ}
+keystone user-role-add --user_id ${MGMT_ID} --role admin --tenant ${ADMIN_PRJ}
+keystone user-role-add --user_id ${ADMIN_ID} --role Member --tenant ${ADMIN_PRJ}
+keystone user-role-add --user_id ${MGMT_ID} --role Member --tenant ${ADMIN_PRJ}
+
+keystone user-role-add --user_id ${ADMIN_ID} --role KeystoneAdmin --tenant admin
+keystone user-role-add --user_id ${ADMIN_ID} --role KeystoneServiceAdmin --tenant admin
+keystone user-role-add --user_id ${ADMIN_ID} --role sysadmin --tenant admin
+keystone user-role-add --user_id ${ADMIN_ID} --role netadmin --tenant admin
+
+keystone service-create --name=glance --type=image --description 'OpenStack Image Service'
+keystone endpoint-create \
+        --region Home \
+        --service-id=$(keystone service-list | awk '/ image / {print $2}') \
+        --publicurl=http://${MGMT_IP}:9292/v1 \
+        --internalurl=http://${MGMT_IP}:9292/v1 \
+        --adminurl=http://${MGMT_IP}:9292/v1
+
+keystone service-create --name=nova --type=compute --description 'OpenStack Compute Service'
+keystone endpoint-create \
+        --region Home \
+        --service-id=$(keystone service-list | awk '/ compute / {print $2}') \
+        --publicurl=http://${MGMT_IP}:8774/v2/%\(tenant_id\)s \
+        --internalurl=http://${MGMT_IP}:8774/v2/%\(tenant_id\)s \
+        --adminurl=http://${MGMT_IP}:8774/v2/%\(tenant_id\)s
+
+keystone service-create --name=neutron --type=network --description 'OpenStack Network(Neutron) Service'
+keystone endpoint-create \
+        --region Home \
+        --service-id=$(keystone service-list | awk '/ neutron / {print $2}') \
+        --publicurl=http://${MGMT_IP}:9696 \
+        --internalurl=http://${MGMT_IP}:9696 \
+        --adminurl=http://${MGMT_IP}:9696
+
+keystone service-create --name=keystone --type=identity --description 'OpenStack Identity Service'
+keystone endpoint-create \
+        --region Home \
+        --service-id=$(keystone service-list | awk '/ identity / {print $2}') \
+        --publicurl="http://${MGMT_IP}:5000/v2.0" \
+        --internalurl="http://${MGMT_IP}:5000/v2.0" \
+        --adminurl="http://${MGMT_IP}:35357/v2.0"
+
+keystone service-create --name=volume --type=volume --description 'OpenStack Volume Service'
+keystone endpoint-create \
+        --region Home \
+        --service-id=$(keystone service-list | awk '/ volume / {print $2}') \
+        --publicurl="http://${MGMT_IP}:8776/v1/%(tenant_id)s" \
+        --internalurl="http://${MGMT_IP}:8776/v1/%(tenant_id)s" \
+        --adminurl="http://${MGMT_IP}:8776/v1/%(tenant_id)s"
+
+keystone service-create --name=cinder --type=volume --description 'OpenStack Volume Service'
+keystone endpoint-create \
+        --region Home \
+        --service-id=$(keystone service-list | awk '/ volume / {print $2}') \
+        --publicurl="http://${MGMT_IP}:8776/v1/%(tenant_id)s" \
+        --internalurl="http://${MGMT_IP}:8776/v1/%(tenant_id)s" \
+        --adminurl="http://${MGMT_IP}:8776/v1/%(tenant_id)s"
+
+keystone service-create --name=cinder2 --type=volume2 --description 'OpenStack Volume Service v2'
+keystone endpoint-create \
+        --region Home \
+        --service-id=$(keystone service-list | awk '/ volume2 / {print $2}') \
+        --publicurl="http://${MGMT_IP}:8776/v2/%(tenant_id)s" \
+        --internalurl="http://${MGMT_IP}:8776/v2/%(tenant_id)s" \
+        --adminurl="http://${MGMT_IP}:8776/v2/%(tenant_id)s"
+
+ufw allow in on ${MGMT_NIC} proto tcp to ${MGMT_IP} port 5000
+ufw allow in on ${MGMT_NIC} proto tcp to ${MGMT_IP} port 35357
+
+keystone service-list
+
+unset SERVICE_TOKEN
+unset SERVICE_ENDPOINT
+export OS_USERNAME=${ADMIN_ID}
+export OS_PASSWORD=${ADMIN_PW}
+export OS_TENANT_NAME=${ADMIN_PRJ}
+export OS_AUTH_URL=http://${MGMT_IP}:35357/v2.0
+keystone token-get
+keystone user-list
+keystone user-role-list --user ${ADMIN_ID} --tenant ${ADMIN_PRJ}
+
+
+export SERVICE_TOKEN=${ADMIN_PW}
+export SERVICE_ENDPOINT=http://${MGMT_IP}:35357/v2.0
+
+#===============================================================================
+# Setup Python Clinet
+apt-get install -fy python-openstackclient
+cat > ~/.openrc.sh <<EOF
+export OS_USERNAME=${ADMIN_ID}
+export OS_PASSWORD=${ADMIN_PW}
+export OS_TENANT_NAME=${ADMIN_PRJ}
+export OS_AUTH_URL=http://${MGMT_IP}:35357/v2.0
+EOF
+chmod +x ~/.openrc.sh
+
+#===============================================================================
+# Setup Glance
+apt-get install -fy glance
+service glance-registry stop
+service glance-api stop
+
+rm -rf /var/lib/glance/glance.sqlite
+mysql -u${MGMT_ID} -p${INTERNAL_PW} -e "DROP DATABASE IF EXISTS glance;"
+mysql -u${MGMT_ID} -p${INTERNAL_PW} -e "CREATE DATABASE glance;"
+
+rm -rf /var/lib/glance/images/*
+
+backup_conf "/etc/glance/glance-api.conf"
+backup_conf "/etc/glance/glance-registry.conf"
+
+sed -i -e "s/^\(sqlite_db\)/#\1/g" \
+       -e "s/^\(auth_host\)\s*=.*/\1 = ${MGMT_IP}/g" \
+       -e "s/^\(admin_tenant_name\)\s*=.*/\1 = ${ADMIN_PRJ}/g" \
+       -e "s/^\(admin_user\)\s*=.*/\1 = ${MGMT_ID}/g" \
+       -e "s/^\(admin_password\)\s*=.*/\1 = ${INTERNAL_PW}/g" \
+       /etc/glance/*.conf
+
+ini-set /etc/glance/glance-api.conf DEFAULT bind_host ${MGMT_IP}
+ini-set /etc/glance/glance-api.conf DEFAULT verbose True
+ini-set /etc/glance/glance-registry.conf DEFAULT verbose True
+ini-set /etc/glance/glance-api.conf paste_deploy flavor keystone
+ini-set /etc/glance/glance-registry.conf paste_deploy flavor keystone
+ini-set /etc/glance/glance-api.conf database connection mysql://${MGMT_ID}:${INTERNAL_PW}@${MGMT_IP}/glance
+ini-set /etc/glance/glance-registry.conf database connection mysql://${MGMT_ID}:${INTERNAL_PW}@${MGMT_IP}/glance
+
+su -s /bin/sh -c "glance-manage db_sync" glance
+
+service glance-registry start
+service glance-api start
+
+ufw allow in on ${MGMT_NIC} proto tcp to ${MGMT_IP} port 9292
+
+sleep 5
+
+TMP_DIR=$(mktemp --directory --tmpdir=/tmp/ tmp-XXXXXXXXX)
+wget -O ${DISK_IMAGE_NAME} "${DISK_IMAGE_HOST}/${DISK_IMAGE_NAME}.tar.gz"
+tar -xzvf ${DISK_IMAGE_NAME} -C ${TMP_DIR}
+
+DISK_FILE_NAME=`ls ${TMP_DIR}/*.img | head -n 1 | cut -d'/' -f 4 | cut -d'.' -f 1`
+echo "${DISK_FILE_NAME}"
+GLANCE_OPT="-I ${MGMT_ID} -K ${INTERNAL_PW} -T ${ADMIN_ID} -N http://${MGMT_IP}:35357/v2.0"
+glance ${GLANCE_OPT} \
+  image-create \
+    --name "${DISK_FILE_NAME}-kernel" \
+    --is-public true \
+    --container-format aki \
+    --disk-format aki \
+  < ${TMP_DIR}/${DISK_FILE_NAME}-vmlinuz-generic
+
+KERNEL_ID=$(glance ${GLANCE_OPT} image-list | grep -m 1 "${DISK_FILE_NAME}-kernel " | awk "{print \$2}")
+
+glance $GLANCE_OPT \
+  image-create \
+    --name "${DISK_FILE_NAME}" \
+    --is-public true \
+    --container-format ami \
+    --disk-format ami \
+    --property kernel_id=$KERNEL_ID \
+  < ${TMP_DIR}/${DISK_FILE_NAME}.img
+IMAGE_ID=$(glance ${GLANCE_OPT} image-list | grep -m 1 "${DISK_FILE_NAME} " | awk "{print \$2}")
+
+echo "Added ${DISK_IMAGE_NAME}. Image ID:$IMAGE_ID, Kernel ID:$KERNEL_ID"
+
+# - Windows 2012r2:
+# If you need to run Windows 2012 in your OpenStack, visit: http://cloudbase.it/ws2012r2 to download the image "windows_server_2012_r2_standard_eval_kvm_20131117.qcow2.gz", then, run:
+# gunzip /root/windows_server_2012_r2_standard_eval_kvm_20131117.qcow2.gz
+# glance image-create --name "Windows Server 2012 R2 Standard Eval" --container-format bare --disk-format qcow2 --is-public 
+
+rm -rf ${TMP_DIR} 2> /dev/null
+
+#===============================================================================
+# Nova-api
+
+apt-get install -fy nova-api nova-cert nova-conductor nova-consoleauth \
+  nova-novncproxy nova-scheduler python-novaclient
+
+service nova-api stop
+service nova-cert stop
+service nova-consoleauth stop
+service nova-scheduler stop
+service nova-conductor stop
+service nova-novncproxy stop
+
+rm -rf /var/lib/nova/nova.sqlite
+
+mysql -u${MGMT_ID} -p${INTERNAL_PW} -e "DROP DATABASE IF EXISTS nova;"
+mysql -u${MGMT_ID} -p${INTERNAL_PW} -e "CREATE DATABASE nova;"
+
+backup_conf "/etc/nova/nova.conf"
+
+sed -i -e "s/^\(sqlite_db\)/#\1/g" \
+       /etc/nova/nova.conf
+
+# - System
+ini-set /etc/nova/nova.conf DEFAULT DEFAULT verbose True
+ini-set /etc/nova/nova.conf DEFAULT host ${MGMT_IP}
+ini-set /etc/nova/nova.conf DEFAULT my_ip ${MGMT_IP}
+ini-set /etc/nova/nova.conf DEFAULT vncserver_listen ${PUBLIC_IP}
+ini-set /etc/nova/nova.conf DEFAULT vncserver_proxyclient_address ${PUBLIC_IP}
+ini-set /etc/nova/nova.conf DEFAULT vncproxy_url "http://${MGMT_IP}:28080"
+
+# - RabbitMQ
+ini-set /etc/nova/nova.conf DEFAULT rpc_backend rabbit
+ini-set /etc/nova/nova.conf DEFAULT rabbit_host ${MGMT_IP}
+ini-set /etc/nova/nova.conf DEFAULT rabbit_port 5672
+ini-set /etc/nova/nova.conf DEFAULT rabbit_use_ssl false
+ini-set /etc/nova/nova.conf DEFAULT rabbit_userid guest
+ini-set /etc/nova/nova.conf DEFAULT rabbit_password ${INTERNAL_PW}
+
+# - Glance
+ini-set /etc/nova/nova.conf DEFAULT glance_host ${MGMT_IP}
+ini-set /etc/nova/nova.conf DEFAULT glance_port 9292
+
+# - Volume
+ini-set /etc/nova/nova.conf DEFAULT volume_group nova-volumes
+
+# - Keystone
+ini-set /etc/nova/nova.conf DEFAULT auth_strategy keystone
+ini-set /etc/nova/nova.conf keystone_authtoken auth_host ${MGMT_IP}
+ini-set /etc/nova/nova.conf keystone_authtoken auth_uri http://${MGMT_IP}:5000
+ini-set /etc/nova/nova.conf keystone_authtoken auth_port 35357
+ini-set /etc/nova/nova.conf keystone_authtoken auth_protocol http
+ini-set /etc/nova/nova.conf keystone_authtoken admin_tenant_name ${ADMIN_PRJ}
+ini-set /etc/nova/nova.conf keystone_authtoken admin_user ${MGMT_ID}
+ini-set /etc/nova/nova.conf keystone_authtoken admin_password ${INTERNAL_PW}
+
+ini-set /etc/nova/nova.conf database db_max_retries -1
+ini-set /etc/nova/nova.conf database connection mysql://${MGMT_ID}:${INTERNAL_PW}@${MGMT_IP}/nova
+
+ufw allow in on ${MGMT_NIC} proto tcp to ${MGMT_IP} port 8773
+ufw allow in on ${MGMT_NIC} proto tcp to ${MGMT_IP} port 8774
+ufw allow in on ${MGMT_NIC} proto tcp to ${MGMT_IP} port 8775
+
+su -s /bin/sh -c "nova-manage db sync" nova
+
+service nova-api start
+service nova-cert start
+service nova-consoleauth start
+service nova-scheduler start
+service nova-conductor start
+service nova-novncproxy start
+
+sleep 10
+
+# - Update Flavor List
+nova flavor-delete 1
+nova flavor-delete 2
+nova flavor-delete 3
+nova flavor-delete 4
+nova flavor-delete 5
+
+# - Standard Flavor
+nova flavor-create --ephemeral 0 --swap 128 --rxtx-factor 1.0 --is-public yes m1.micro 1 256 5 1
+nova flavor-create --ephemeral 25 --swap 256 --rxtx-factor 1.0 --is-public yes m1.tiny 2 512 10 1
+nova flavor-create --ephemeral 50 --swap 512 --rxtx-factor 1.0 --is-public yes m1.small 3 1024 10 1
+nova flavor-create --ephemeral 100 --swap 1024 --rxtx-factor 1.0 --is-public yes m1.medium 4 2048 10 2
+nova flavor-create --ephemeral 200 --swap 2048 --rxtx-factor 1.0 --is-public yes m1.large 5 4096 10 4
+nova flavor-create --ephemeral 400 --swap 4096 --rxtx-factor 1.0 --is-public yes m1.xlarge 6 8192 10 8
+
+# - RAM Memory optimized
+nova flavor-create --ephemeral 0 --swap 256 --rxtx-factor 1.0 --is-public yes r1.micro 7 512 5 1
+nova flavor-create --ephemeral 25 --swap 512 --rxtx-factor 1.0 --is-public yes r1.tiny 8 1024 10 1
+nova flavor-create --ephemeral 50 --swap 1024 --rxtx-factor 1.0 --is-public yes r1.small 9 2048 10 1
+nova flavor-create --ephemeral 100 --swap 2048 --rxtx-factor 1.0 --is-public yes r1.medium 10 4096 10 2
+nova flavor-create --ephemeral 200 --swap 4096 --rxtx-factor 1.0 --is-public yes r1.large 11 8192 10 4
+nova flavor-create --ephemeral 400 --swap 8192 --rxtx-factor 1.0 --is-public yes r1.xlarge 12 16384 10 8
+
+# - Storage optimized 
+nova flavor-create --ephemeral 50 --swap 256 --rxtx-factor 1.0 --is-public yes s1.tiny 13 512 10 1
+nova flavor-create --ephemeral 100 --swap 512 --rxtx-factor 1.0 --is-public yes s1.small 14 1024 10 1
+nova flavor-create --ephemeral 200 --swap 1024 --rxtx-factor 1.0 --is-public yes s1.medium 15 2048 20 2
+nova flavor-create --ephemeral 400 --swap 2048 --rxtx-factor 1.0 --is-public yes s1.large 16 4096 40 4
+nova flavor-create --ephemeral 800 --swap 4096 --rxtx-factor 1.0 --is-public yes s1.xlarge 17 8192 80 8
+
+
+#===============================================================================
+# Nova-Network(Neutron)
+apt-get install -fy neutron-server \
+  neutron-plugin-ml2 neutron-plugin-openvswitch-agent neutron-dhcp-agent neutron-metadata-agent
+ADMIN_PRJ_ID=$(keystone tenant-get ${ADMIN_PRJ} | awk '/ id / {print $4}')
+
+service nova-api stop
+service nova-scheduler stop
+service nova-conductor stop
+service neutron-server stop
+
+rm -rf /var/lib/neutron/neutron.sqlite
+
+mysql -u${MGMT_ID} -p${INTERNAL_PW} -e "DROP DATABASE IF EXISTS neutron;"
+mysql -u${MGMT_ID} -p${INTERNAL_PW} -e "CREATE DATABASE neutron;"
+
+backup_conf "/etc/neutron/neutron.conf"
+backup_conf "/etc/neutron/plugins/ml2/ml2_conf.ini"
+backup_conf "/etc/neutron/api-paste.ini"
+backup_conf "/etc/neutron/metadata_agent.ini"
+backup_conf "/etc/neutron/dhcp_agent.ini"
+
+# - neutron
+ini-set /etc/nova/nova.conf DEFAULT network_api_class nova.network.neutronv2.api.API
+ini-set /etc/nova/nova.conf DEFAULT neutron_url http://${MGMT_IP}:9696
+ini-set /etc/nova/nova.conf DEFAULT neutron_auth_strategy keystone
+ini-set /etc/nova/nova.conf DEFAULT neutron_admin_tenant_name ${ADMIN_PRJ}
+ini-set /etc/nova/nova.conf DEFAULT neutron_region_name Home
+ini-set /etc/nova/nova.conf DEFAULT neutron_admin_username ${MGMT_ID}
+ini-set /etc/nova/nova.conf DEFAULT neutron_admin_password ${INTERNAL_PW}
+ini-set /etc/nova/nova.conf DEFAULT neutron_admin_auth_url http://${MGMT_IP}:35357/v2.0
+ini-set /etc/nova/nova.conf DEFAULT linuxnet_interface_driver nova.network.linux_net.LinuxOVSInterfaceDriver
+ini-set /etc/nova/nova.conf DEFAULT firewall_driver nova.virt.firewall.NoopFirewallDriver
+ini-set /etc/nova/nova.conf DEFAULT security_group_api neutron
+
+# - Global
+ini-set /etc/neutron/neutron.conf DEFAULT verbose True
+#ini-set /etc/neutron/neutron.conf DEFAULT core_plugin neutron.plugins.openvswitch.ovs_neutron_plugin.OVSNeutronPluginV2
+ini-set /etc/neutron/neutron.conf DEFAULT core_plugin ml2
+ini-set /etc/neutron/neutron.conf DEFAULT service_plugins router
+ini-set /etc/neutron/neutron.conf DEFAULT allow_overlapping_ips True
+
+# - RabbitMQ
+ini-set /etc/neutron/neutron.conf DEFAULT rpc_backend neutron.openstack.common.rpc.impl_kombu
+ini-set /etc/neutron/neutron.conf DEFAULT rabbit_host ${MGMT_IP}
+ini-set /etc/neutron/neutron.conf DEFAULT rabbit_port 5672
+ini-set /etc/neutron/neutron.conf DEFAULT rabbit_use_ssl false
+ini-set /etc/neutron/neutron.conf DEFAULT rabbit_userid guest
+ini-set /etc/neutron/neutron.conf DEFAULT rabbit_password ${INTERNAL_PW}
+
+# - Nova
+ini-set /etc/neutron/neutron.conf DEFAULT bind_host ${MGMT_IP}
+ini-set /etc/neutron/neutron.conf DEFAULT notify_nova_on_port_status_changes True
+ini-set /etc/neutron/neutron.conf DEFAULT notify_nova_on_port_data_changes True
+ini-set /etc/neutron/neutron.conf DEFAULT nova_url http://${MGMT_IP}:8774/v2
+ini-set /etc/neutron/neutron.conf DEFAULT nova_region_name Home
+ini-set /etc/neutron/neutron.conf DEFAULT nova_admin_username ${MGMT_ID}
+ini-set /etc/neutron/neutron.conf DEFAULT nova_admin_tenant_id ${ADMIN_PRJ_ID}
+ini-set /etc/neutron/neutron.conf DEFAULT nova_admin_password ${INTERNAL_PW}
+ini-set /etc/neutron/neutron.conf DEFAULT nova_admin_auth_url http://${MGMT_IP}:35357/v2.0
+
+# - Keystone
+ini-set /etc/neutron/neutron.conf DEFAULT auth_strategy keystone
+ini-set /etc/neutron/neutron.conf keystone_authtoken auth_host ${MGMT_IP}
+ini-set /etc/neutron/neutron.conf keystone_authtoken auth_uri http://${MGMT_IP}:5000
+ini-set /etc/neutron/neutron.conf keystone_authtoken auth_port 35357
+ini-set /etc/neutron/neutron.conf keystone_authtoken auth_protocol http
+ini-set /etc/neutron/neutron.conf keystone_authtoken admin_tenant_name ${ADMIN_PRJ}
+ini-set /etc/neutron/neutron.conf keystone_authtoken admin_user ${MGMT_ID}
+ini-set /etc/neutron/neutron.conf keystone_authtoken admin_password ${INTERNAL_PW}
+
+# - DB
+ini-set /etc/neutron/neutron.conf database connection mysql://${MGMT_ID}:${INTERNAL_PW}@${MGMT_IP}/neutron
+
+# - ML2
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ml2 type_drivers local,flat
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ml2 mechanism_drivers openvswitch,l2population
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ml2_type_flat flat_networks "*"
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini securitygroup enable_security_group True
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini securitygroup firewall_driver neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ovs enable_tunneling False
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ovs local_ip ${PUBLIC_IP}
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ovs network_vlan_ranges physnet1
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ovs bridge_mappings physnet1:br-eth0
+
+ini-set /etc/neutron/metadata_agent.ini DEFAULT auth_url http://${PUBLIC_IP}:5000/v2.0
+ini-set /etc/neutron/metadata_agent.ini DEFAULT auth_region Home
+ini-set /etc/neutron/metadata_agent.ini DEFAULT admin_tenant_name ${ADMIN_PRJ}
+ini-set /etc/neutron/metadata_agent.ini DEFAULT admin_user ${MGMT_ID}
+ini-set /etc/neutron/metadata_agent.ini DEFAULT admin_password ${INTERNAL_PW}
+ini-set /etc/neutron/metadata_agent.ini DEFAULT nova_metadata_ip ${MGMT_IP}
+ini-set /etc/neutron/metadata_agent.ini DEFAULT nova_metadata_port 8775
+ini-set /etc/neutron/metadata_agent.ini DEFAULT metadata_proxy_shared_secret  ${INTERNAL_PW}
+
+ini-set /etc/neutron/dhcp_agent.ini DEFAULT interface_driver neutron.agent.linux.interface.OVSInterfaceDriver
+ini-set /etc/neutron/dhcp_agent.ini DEFAULT use_namespaces True
+ini-set /etc/neutron/dhcp_agent.ini DEFAULT enable_isolated_metadata True
+ini-unset /etc/neutron/dhcp_agent.ini DEFAULT dhcp_domain
+
+# - ovs test planed.(TODO)
+#ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ml2 type_drivers gre
+#ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ml2 tenant_network_types gre
+#ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ml2 mechanism_drivers openvswitch
+#ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ml2_type_gre tunnel_id_ranges 1:1000
+#ini-set /etc/neutron/plugins/ml2/ml2_conf.ini securitygroup firewall_driver neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+#ini-set /etc/neutron/plugins/ml2/ml2_conf.ini securitygroup enable_security_group True
+
+#CNT=`grep "AUTH_TOKEN_SET" /etc/neutron/api-paste.ini | wc -l`
+#if [ "$CNT" -gt "0" ]; then
+#  sed -i "/#<<AUTH_TOKEN_SET/,/#>>AUTH_TOKEN_SET/d" /etc/neutron/api-paste.ini
+#fi
+
+#cat >> /etc/neutron/api-paste.ini << EOF
+#<<AUTH_TOKEN_SET
+#[filter:authtoken]
+#paste.filter_factory = keystoneclient.middleware.auth_token:filter_factory
+#admin_tenant_name = ${ADMIN_PRJ}
+#admin_user = ${MGMT_ID}
+#admin_password = ${INTERNAL_PW}
+##>>AUTH_TOKEN_SET
+#EOF
+
+ufw allow in on ${MGMT_NIC} proto tcp to ${MGMT_IP} port 9696
+
+service nova-api start
+service nova-scheduler start
+service nova-conductor start
+service neutron-server start
+
+sleep 10
+
+neutron \
+  net-create \
+    --tenant-id ${ADMIN_PRJ_ID} sharednet1 --shared \
+    --provider:network_type flat \
+    --provider:physical_network physnet1
+
+neutron \
+  subnet-create \
+    --ip-version 4 \
+    --tenant-id ${ADMIN_PRJ_ID} sharednet1 10.1.1.0/24 \
+    --allocation-pool start=10.1.1.80,end=10.1.1.90 \
+    --dns_nameservers list=true 8.8.4.4 8.8.8.8
+
+
+# - TODO
+#neutron net-create pub-net --shared --router:external=True
+#neutron subnet-create pub-net --name pub-subnet \
+#  --allocation-pool start=10.1.1.70,end=10.1.1.80 \
+#  --disable-dhcp --gateway 10.1.1.1 10.1.1.0/24
+
+# neutron subnet-create private-net --name private-subnet --gateway 10.3.0.1 10.3.0.0/16
+# neutron router-create private-router
+# neutron router-interface-add private-router private-subnet
+# neutron router-gateway-set private-router pub-net
+
+
+#===============================================================================
+# Nova-Volume(Cinder)
+apt-get install -fy cinder-api cinder-scheduler
+
+service cinder-scheduler stop
+service cinder-api stop
+
+mysql -u${MGMT_ID} -p${INTERNAL_PW} -e "DROP DATABASE IF EXISTS cinder;"
+mysql -u${MGMT_ID} -p${INTERNAL_PW} -e "CREATE DATABASE cinder;"
+
+backup_conf "/etc/cinder/cinder.conf"
+
+# - RabbitMQ
+ini-set /etc/cinder/cinder.conf DEFAULT rpc_backend cinder.openstack.common.rpc.impl_kombu
+ini-set /etc/cinder/cinder.conf DEFAULT rabbit_host ${MGMT_IP}
+ini-set /etc/cinder/cinder.conf DEFAULT rabbit_port 5672
+ini-set /etc/cinder/cinder.conf DEFAULT rabbit_use_ssl false
+ini-set /etc/cinder/cinder.conf DEFAULT rabbit_userid guest
+ini-set /etc/cinder/cinder.conf DEFAULT rabbit_password ${INTERNAL_PW}
+
+# - Keystone
+ini-set /etc/cinder/cinder.conf DEFAULT auth_strategy keystone
+ini-set /etc/cinder/cinder.conf keystone_authtoken auth_host ${MGMT_IP}
+ini-set /etc/cinder/cinder.conf keystone_authtoken auth_uri http://${MGMT_IP}:5000
+ini-set /etc/cinder/cinder.conf keystone_authtoken auth_port 35357
+ini-set /etc/cinder/cinder.conf keystone_authtoken auth_protocol http
+ini-set /etc/cinder/cinder.conf keystone_authtoken admin_tenant_name ${ADMIN_PRJ}
+ini-set /etc/cinder/cinder.conf keystone_authtoken admin_user ${MGMT_ID}
+ini-set /etc/cinder/cinder.conf keystone_authtoken admin_password ${INTERNAL_PW}
+
+
+# - DB
+ini-set /etc/cinder/cinder.conf database connection mysql://${MGMT_ID}:${INTERNAL_PW}@${MGMT_IP}/cinder
+
+su -s /bin/sh -c "cinder-manage db sync" cinder
+
+ufw allow in on ${MGMT_NIC} proto tcp to ${MGMT_IP} port 8776
+
+su -s /bin/sh -c "nova-manage db sync" nova
+
+service cinder-scheduler start
+service cinder-api start
+
+sleep 10
+
+
+
+#===============================================================================
+# Horizon
+
+apt-get install -fy apache2 memcached libapache2-mod-wsgi openstack-dashboard
+#apt-get remove --purge openstack-dashboard-ubuntu-theme
+sed -i -e "s/^\(OPENSTACK_HOST\).*/\1 = \"${MGMT_IP}\"/g" \
+       -e "s/^\(TIME_ZONE\).*/\1 = \"Asia\/Seoul\"/g" /etc/openstack-dashboard/local_settings.py
+
+service apache2 restart
+service memcached restart
+
+ufw allow in on ${PUBLIC_NIC} proto tcp to ${PUBLIC_IP} port 80
