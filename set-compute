@@ -125,10 +125,10 @@ apt-get install -fy \
   nova-compute-kvm python-guestfs
 
 service nova-compute stop
-rm -f /var/lib/nova/nova.sqlite
+service dbus stop
+service libvirt-bin stop
 
-virsh net-destroy default
-virsh net-undefine default
+rm -f /var/lib/nova/nova.sqlite
 
 backup_conf "/etc/nova/nova.conf"
 backup_conf "/etc/nova/nova-compute.conf"
@@ -193,6 +193,8 @@ sed -i 's/^\(env\s+libvirtd_opts\)=.*/\1="-d -l"/' /etc/init/libvirt-bin.conf
 sed -i 's/^\(libvirtd_opts\)=.*/\1="-d -l"/' /etc/default/libvirt-bin
 
 service nova-compute restart
+service dbus restart
+service libvirt-bin restart
 
 
 #===============================================================================
@@ -213,6 +215,10 @@ virsh net-undefine default
 backup_conf "/etc/nova/nova.conf"
 backup_conf "/etc/neutron/neutron.conf"
 backup_conf "/etc/neutron/plugins/ml2/ml2_conf.ini"
+
+
+virsh net-destroy default
+virsh net-undefine default
 
 
 ini-set /etc/nova/nova.conf DEFAULT DEFAULT verbose True
@@ -271,6 +277,8 @@ ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ovs enable_tunneling False
 ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ovs local_ip ${PUBLIC_IP}
 ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ovs network_vlan_ranges physnet1
 ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ovs bridge_mappings physnet1:br-eth0
+
+
 
 # Prepare /etc/libvirt/libvirtd.conf:
 sed -i 's/^#\(listen_tls\)\s*=.*/\1 = 0/' /etc/libvirt/libvirtd.conf
