@@ -2,3 +2,286 @@
 #
 # - code by Jioh L. Jung (ziozzang@gmail.com)
 #
+PUBLIC_IP=${PUBLIC_IP:-"10.1.1.150"}
+PUBLIC_NIC=${PUBLIC_NIC:-"eth0"}
+MGMT_IP=${MGMT_IP:-"10.2.0.2"}
+MGMT_NIC=${MGMT_NIC:-"eth1"}
+PRIVATE_IP=${PRIVATE_IP:-"10.3.0.2"}
+PRIVATE_NIC=${PRIVATE_NIC:-"eth2"}
+
+MGMT_ID=${MGMT_ID:-"system"}
+MGMT_HOST=${MGMT_HOST:-"notyet"}
+
+ADMIN_PRJ=${ADMIN_PRJ:-"home"}
+
+INTERNAL_PW=${INTERNAL_PW:-"notyet"}
+SERVICE_TENANT_ID=${SERVICE_TENANT_ID:-"notyet"}
+
+# Physical Index for Private Network.
+PHY_IDX=${PHY_IDX:-"0"}
+
+###################################################
+#
+[[ "$(id -u)" -eq 0 ]] || (echo "no root permission"; exit 1)
+[[ "${INTERNAL_PW}" == "notyet" ]] || (echo "set INTERNAL_PW please"; exit 1)
+[[ "${MGMT_HOST}" == "notyet" ]] || (echo "set MGMT_HOST please"; exit 1)
+[[ "${SERVICE_TENANT_ID}" == "notyet" ]] || (echo "set SERVICE_TENANT_ID please"; exit 1)
+[[ `egrep -c '(vmx|svm)' /proc/cpuinfo` -eq "0" ]] || (echo "no cpu support"; exit 1)
+
+CNT=`grep IPSET_OK /etc/network/interfaces | wc -l`
+if [ "$CNT" -eq "0" ]; then
+  cat > /etc/network/interfaces << EOF
+# IPSET_OK
+# PUBLIC
+auto ${PUBLIC_NIC}
+iface ${PUBLIC_NIC} inet static
+address ${PUBLIC_IP}
+netmask 255.255.255.0
+gateway 10.1.1.1
+
+# MGMT
+auto ${MGMT_NIC}
+iface ${MGMT_NIC} inet static
+address ${MGMT_IP}
+netmask 255.255.0.0
+
+# PRIVATE
+auto ${PRIVATE_NIC}
+iface ${PRIVATE_NIC} inet static
+address ${PRIVATE_IP}
+netmask 255.255.0.0
+
+dns-nameservers 8.8.8.8
+EOF
+  cat > /etc/resolv.conf << EOF
+nameserver 8.8.8.8
+EOF
+  wget -O "/usr/bin/ini-set" "https://raw.githubusercontent.com/ziozzang/openstack-at-home-ubuntu/master/ini-set"
+  chmod +x /usr/bin/ini-set
+  wget -O "/usr/bin/ini-unset" "https://raw.githubusercontent.com/ziozzang/openstack-at-home-ubuntu/master/ini-unset"
+  chmod +x /usr/bin/ini-unset
+  
+  #sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+  #sysctl -p
+  
+  echo 'kvm_intel' >> /etc/modules
+  echo 'vhost_net' >> /etc/modules
+  
+  apt-get update
+  apt-get upgrade -fy
+
+  # NTP install
+  apt-get install -fy ntp
+  NTP_CONF="/etc/ntp.conf"
+  CNT=`grep KOREAN_SERVER ${NTP_CONF} | wc -l`
+  if [[ "$CNT" -eq "0" ]]; then
+    sed -i -e "s/^server/#server/g" ${NTP_CONF}
+    # Set Korean NTP server
+    echo "#KOREAN_SERVER" >> ${NTP_CONF}
+    echo "server time.bora.net" >> ${NTP_CONF}
+    echo "server time.kriss.re.kr" >> ${NTP_CONF}
+    echo "server time.nuri.net" >> ${NTP_CONF}
+  fi
+
+  echo "Rebooting system..."
+  reboot
+else
+  echo "enter Phase #2"
+
+fi
+
+apt-get install -fy nova-compute-kvm python-guestfs
+dpkg-statoverride  --update --add root root 0644 /boot/vmlinuz-$(uname -r)
+
+cat > /etc/kernel/postinst.d/statoverride << EOF
+#!/bin/sh
+version="\$1"
+# passing the kernel version is required
+[ -z "${version}" ] && exit 0
+dpkg-statoverride --update --add root root 0644 /boot/vmlinuz-${version}
+EOF
+
+chmod +x /etc/kernel/postinst.d/statoverride
+
+
+#===============================================================================
+# Functions
+
+backup_conf() {
+  local fn="$1"
+  if [[ -f "${fn}.org" ]]; then
+    cp -f ${fn}.org ${fn}
+  else
+    cp -f ${fn} ${fn}.org
+  fi
+}
+
+#===============================================================================
+# Setup nova
+apt-get install -fy \
+  linux-image-extra-`uname -r` \
+  ubuntu-virt-server libvirt-bin \
+  pm-utils \
+  nova-compute-kvm python-guestfs
+
+service nova-compute stop
+rm -f /var/lib/nova/nova.sqlite
+
+virsh net-destroy default
+virsh net-undefine default
+
+backup_conf "/etc/nova/nova.conf"
+backup_conf "/etc/nova/nova-compute.conf"
+backup_conf "/etc/libvirt/libvirtd.conf"
+backup_conf "/etc/init/libvirt-bin.conf"
+
+
+ini-set /etc/nova/nova.conf DEFAULT DEFAULT verbose True
+ini-set /etc/nova/nova.conf DEFAULT host ${MGMT_HOST}
+
+ini-set /etc/nova/nova.conf DEFAULT my_ip ${MGMT_IP}
+
+
+# - Glance
+ini-set /etc/nova/nova.conf DEFAULT glance_host ${MGMT_HOST}
+ini-set /etc/nova/nova.conf DEFAULT glance_port 9292
+
+# - Volume
+ini-set /etc/nova/nova.conf DEFAULT volume_group nova-volumes
+
+# - VNC
+ini-set /etc/nova/nova.conf DEFAULT vnc_enabled True
+ini-set /etc/nova/nova.conf DEFAULT vncserver_listen 0.0.0.0
+ini-set /etc/nova/nova.conf DEFAULT vncserver_proxyclient_address ${PUBLIC_IP}
+ini-set /etc/nova/nova.conf DEFAULT vncproxy_url "http://${MGMT_HOST}:28080"
+ini-set /etc/nova/nova.conf DEFAULT novncproxy_base_url "http://${MGMT_HOST}:6080/vnc_auto.html"
+
+# - RabbitMQ
+ini-set /etc/nova/nova.conf DEFAULT rpc_backend rabbit
+ini-set /etc/nova/nova.conf DEFAULT rabbit_host ${MGMT_HOST}
+ini-set /etc/nova/nova.conf DEFAULT rabbit_port 5672
+ini-set /etc/nova/nova.conf DEFAULT rabbit_use_ssl false
+ini-set /etc/nova/nova.conf DEFAULT rabbit_userid guest
+ini-set /etc/nova/nova.conf DEFAULT rabbit_password ${INTERNAL_PW}
+
+# - Keystone
+ini-set /etc/nova/nova.conf DEFAULT auth_strategy keystone
+ini-set /etc/nova/nova.conf keystone_authtoken auth_host ${MGMT_HOST}
+ini-set /etc/nova/nova.conf keystone_authtoken auth_uri http://${MGMT_HOST}:5000
+ini-set /etc/nova/nova.conf keystone_authtoken auth_port 35357
+ini-set /etc/nova/nova.conf keystone_authtoken auth_protocol http
+ini-set /etc/nova/nova.conf keystone_authtoken admin_tenant_name ${ADMIN_PRJ}
+ini-set /etc/nova/nova.conf keystone_authtoken admin_user ${MGMT_ID}
+ini-set /etc/nova/nova.conf keystone_authtoken admin_password ${INTERNAL_PW}
+
+ini-set /etc/nova/nova.conf database db_max_retries -1
+ini-set /etc/nova/nova.conf database connection mysql://${MGMT_ID}:${INTERNAL_PW}@${MGMT_HOST}/nova
+
+ini-set /etc/nova/nova-compute.conf libvirt virt_type qemu
+
+
+
+# Prepare /etc/libvirt/libvirtd.conf:
+sed -i 's/^#\(listen_tls\)\s*=.*/\1 = 0/' /etc/libvirt/libvirtd.conf
+sed -i 's/^#\(listen_tcp\)\s*=.*/\1 = 1/' /etc/libvirt/libvirtd.conf
+sed -i 's/^#\(auth_tcp\)\s*=.*/\1 = "none"/' /etc/libvirt/libvirtd.conf
+
+# Prepare /etc/init/libvirt-bin.conf:
+sed -i 's/^\(env\s+libvirtd_opts\)=.*/\1="-d -l"/' /etc/init/libvirt-bin.conf
+
+# Prepare /etc/default/libvirt-bin:
+sed -i 's/^\(libvirtd_opts\)=.*/\1="-d -l"/' /etc/default/libvirt-bin
+
+service nova-compute restart
+
+
+#===============================================================================
+# Setup Neutron
+
+apt-get install -fy \
+  iptables \
+  neutron-plugin-openvswitch-agent openvswitch-switch
+
+service nova-compute stop
+service neutron-plugin-openvswitch-agent stop
+
+rm -f /var/lib/nova/nova.sqlite
+
+virsh net-destroy default
+virsh net-undefine default
+
+backup_conf "/etc/nova/nova.conf"
+backup_conf "/etc/neutron/neutron.conf"
+backup_conf "/etc/neutron/plugins/ml2/ml2_conf.ini"
+
+
+ini-set /etc/nova/nova.conf DEFAULT DEFAULT verbose True
+ini-set /etc/nova/nova.conf DEFAULT DEFAULT allow_overlapping_ips True
+
+# - RabbitMQ
+ini-set /etc/neutron/neutron.conf DEFAULT rpc_backend neutron.openstack.common.rpc.impl_kombu
+ini-set /etc/neutron/neutron.conf DEFAULT rabbit_host ${MGMT_HOST}
+ini-set /etc/neutron/neutron.conf DEFAULT rabbit_port 5672
+ini-set /etc/neutron/neutron.conf DEFAULT rabbit_use_ssl false
+ini-set /etc/neutron/neutron.conf DEFAULT rabbit_userid guest
+ini-set /etc/neutron/neutron.conf DEFAULT rabbit_password ${INTERNAL_PW}
+
+ini-set /etc/neutron/neutron.conf DEFAULT notify_nova_on_port_status_changes TrueSE
+ini-set /etc/neutron/neutron.conf DEFAULT notify_nova_on_port_data_changes True
+ini-set /etc/neutron/neutron.conf DEFAULT nova_url http://${MGMT_HOST}:8774/v2
+ini-set /etc/neutron/neutron.conf DEFAULT nova_region_name Home
+ini-set /etc/neutron/neutron.conf DEFAULT nova_admin_username ${MGMT_ID}
+ini-set /etc/neutron/neutron.conf DEFAULT nova_admin_tenant_id ${SERVICE_TENANT_ID}
+ini-set /etc/neutron/neutron.conf DEFAULT nova_admin_password service_pass
+ini-set /etc/neutron/neutron.conf DEFAULT nova_admin_auth_url http://${MGMT_HOST}:35357/v2.0
+
+# - Keystone
+ini-set /etc/neutron/neutron.conf DEFAULT auth_strategy keystone
+ini-set /etc/neutron/neutron.conf keystone_authtoken auth_host ${MGMT_HOST}
+ini-set /etc/neutron/neutron.conf keystone_authtoken auth_uri http://${MGMT_HOST}:5000
+ini-set /etc/neutron/neutron.conf keystone_authtoken auth_port 35357
+ini-set /etc/neutron/neutron.conf keystone_authtoken auth_protocol http
+ini-set /etc/neutron/neutron.conf keystone_authtoken admin_tenant_name ${ADMIN_PRJ}
+ini-set /etc/neutron/neutron.conf keystone_authtoken admin_user ${MGMT_ID}
+ini-set /etc/neutron/neutron.conf keystone_authtoken admin_password ${INTERNAL_PW}
+
+# - DB
+ini-set /etc/neutron/neutron.conf database connection mysql://${MGMT_ID}:${INTERNAL_PW}@${MGMT_HOST}/neutron
+
+
+# - neutron
+ini-set /etc/nova/nova.conf DEFAULT network_api_class nova.network.neutronv2.api.API
+ini-set /etc/nova/nova.conf DEFAULT neutron_url http://${MGMT_HOST}:9696
+ini-set /etc/nova/nova.conf DEFAULT neutron_auth_strategy keystone
+ini-set /etc/nova/nova.conf DEFAULT neutron_admin_tenant_name ${ADMIN_PRJ}
+ini-set /etc/nova/nova.conf DEFAULT neutron_region_name Home
+ini-set /etc/nova/nova.conf DEFAULT neutron_admin_username ${MGMT_ID}
+ini-set /etc/nova/nova.conf DEFAULT neutron_admin_password ${INTERNAL_PW}
+ini-set /etc/nova/nova.conf DEFAULT neutron_admin_auth_url http://${MGMT_HOST}:35357/v2.0
+ini-set /etc/nova/nova.conf DEFAULT linuxnet_interface_driver nova.network.linux_net.LinuxOVSInterfaceDriver
+ini-set /etc/nova/nova.conf DEFAULT firewall_driver nova.virt.firewall.NoopFirewallDriver
+ini-set /etc/nova/nova.conf DEFAULT security_group_api neutron
+
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ml2 type_drivers local,flat
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ml2 mechanism_drivers openvswitch,l2population
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ml2_type_flat flat_networks "*"
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini securitygroup enable_security_group True
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini securitygroup firewall_driver neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ovs enable_tunneling False
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ovs local_ip ${PUBLIC_IP}
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ovs network_vlan_ranges physnet1
+ini-set /etc/neutron/plugins/ml2/ml2_conf.ini ovs bridge_mappings physnet1:br-eth0
+
+# Prepare /etc/libvirt/libvirtd.conf:
+sed -i 's/^#\(listen_tls\)\s*=.*/\1 = 0/' /etc/libvirt/libvirtd.conf
+sed -i 's/^#\(listen_tcp\)\s*=.*/\1 = 1/' /etc/libvirt/libvirtd.conf
+sed -i 's/^#\(auth_tcp\)\s*=.*/\1 = "none"/' /etc/libvirt/libvirtd.conf
+
+# Prepare /etc/init/libvirt-bin.conf:
+sed -i 's/^\(env\s+libvirtd_opts\)=.*/\1="-d -l"/' /etc/init/libvirt-bin.conf
+
+# Prepare /etc/default/libvirt-bin:
+sed -i 's/^\(libvirtd_opts\)=.*/\1="-d -l"/' /etc/default/libvirt-bin
+
+service nova-compute restart
+service neutron-plugin-openvswitch-agent restart
