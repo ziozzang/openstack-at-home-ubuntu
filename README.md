@@ -41,4 +41,8 @@ Setup-Compute
 wget -qO- https://raw.githubusercontent.com/ziozzang/openstack-at-home-ubuntu/master/set-compute | bash
 ```
 
+Tip
+===
+
+nestedVM option is vhv.enable="true"
 
