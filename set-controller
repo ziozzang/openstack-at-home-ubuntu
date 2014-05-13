@@ -727,3 +727,29 @@ service apache2 restart
 service memcached restart
 
 ufw allow in on ${PUBLIC_NIC} proto tcp to ${PUBLIC_IP} port 80
+
+#===============================================================================
+# Additional Info Sharing
+mkdir -p /var/www/info
+
+cat > /etc/apache2/sites-available/info-8802.conf << EOF
+Listen 8802
+<VirtualHost *:8802>
+  ServerAdmin webmaster@localhost
+  DocumentRoot /var/www/info
+  ErrorLog ${APACHE_LOG_DIR}/error-info-8802.log
+  CustomLog ${APACHE_LOG_DIR}/access-info-8802.log combined
+</VirtualHost>
+EOF
+
+a2ensite info-8802.conf
+service apache2 reload
+
+ADMIN_PRJ_ID=$(keystone tenant-get ${ADMIN_PRJ} | awk '/ id / {print $4}')
+cat > /var/www/info/vars << EOF
+INTERNAL_PW=${INTERNAL_PW}
+SERVICE_TENANT_ID=${ADMIN_PRJ_ID}
+EOF
+
+
+ufw allow in on ${MGMT_NIC} proto tcp to ${MGMT_IP} port 8802
