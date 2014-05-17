@@ -10,7 +10,7 @@ PRIVATE_IP=${PRIVATE_IP:-"10.3.0.2"}
 PRIVATE_NIC=${PRIVATE_NIC:-"eth2"}
 
 MGMT_ID=${MGMT_ID:-"system"}
-MGMT_HOST=${MGMT_HOST:-"notyet"}
+MGMT_HOST=${MGMT_HOST:-"10.2.0.1"}
 
 ADMIN_PRJ=${ADMIN_PRJ:-"home"}
 
@@ -20,12 +20,18 @@ SERVICE_TENANT_ID=${SERVICE_TENANT_ID:-"notyet"}
 # Physical Index for Private Network.
 PHY_IDX=${PHY_IDX:-"0"}
 
+
 ###################################################
 #
 [[ "$(id -u)" -eq 0 ]] || (echo "no root permission"; exit 1)
-[[ "${INTERNAL_PW}" == "notyet" ]] || (echo "set INTERNAL_PW please"; exit 1)
 [[ "${MGMT_HOST}" == "notyet" ]] || (echo "set MGMT_HOST please"; exit 1)
-[[ "${SERVICE_TENANT_ID}" == "notyet" ]] || (echo "set SERVICE_TENANT_ID please"; exit 1)
+
+TMP_FILE=$(mktemp --tmpdir=/tmp/)
+rm -rf ${TMP_FILE}
+wget -O "${TMP_FILE}" "http://${MGMT_HOST}:8802/vars"
+. ${TMP_FILE}
+rm -rf ${TMP_FILE}
+
 [[ `egrep -c '(vmx|svm)' /proc/cpuinfo` -eq "0" ]] || (echo "no cpu support"; exit 1)
 
 CNT=`grep IPSET_OK /etc/network/interfaces | wc -l`
@@ -89,6 +95,10 @@ else
   echo "enter Phase #2"
 
 fi
+# TODO: Create TEMP files to config read.
+
+[[ "${INTERNAL_PW}" == "notyet" ]] || (echo "set INTERNAL_PW please"; exit 1)
+[[ "${SERVICE_TENANT_ID}" == "notyet" ]] || (echo "set SERVICE_TENANT_ID please"; exit 1)
 
 apt-get install -fy nova-compute-kvm python-guestfs
 dpkg-statoverride  --update --add root root 0644 /boot/vmlinuz-$(uname -r)
